@@ -30,6 +30,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
 PORT = int(os.environ.get("IFZ_LOBBY_PORT", "8080"))
+# 网页面板没有命令行时，靠这一行确认「拉到的确实是新版」：浏览器打开 /health 就能看到。
+VERSION = "2026-11-27.1"
 DATA = os.environ.get("IFZ_LOBBY_DATA", "/root/ifz-lobby/rooms.json")
 TTL = int(os.environ.get("IFZ_LOBBY_TTL", "90"))        # 秒无心跳即过期
 MAX_ROOMS = int(os.environ.get("IFZ_LOBBY_MAX", "200"))
@@ -304,7 +306,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             with _lock:
                 _prune_locked()
-                return self._send({"ok": True, "rooms": len(_rooms),
+                return self._send({"ok": True, "version": VERSION, "rooms": len(_rooms),
                                    "ttl": TTL, "max_rooms": MAX_ROOMS})
         if path == "/api/relay":
             # 客人选台用：这个房间在本台还有几个空座位。只读，不加锁住状态。

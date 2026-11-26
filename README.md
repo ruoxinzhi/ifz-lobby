@@ -41,6 +41,33 @@ sudo bash /opt/ifz-lobby/deploy/update.sh
 它做四件事：拉最新代码 → 重启服务 → 探一次 `/health` → **健康检查失败就自动回滚到上一个提交并重启**。
 所以更新坏了不会把线上打死。
 
+### 没有命令行、只有网页控制面板怎么办
+
+面板通常能给到下面两种能力之一，任选其一，都不用敲命令：
+
+**A. 面板有「Git / 远程仓库 / 代码部署」**
+
+| 填什么 | 值 |
+|---|---|
+| 仓库地址 | `https://github.com/ruoxinzhi/ifz-lobby.git` |
+| 分支 | `main` |
+| 部署目录 | 你现在放 `lobby_server.py` 的那个目录（如 `/opt/ifz-lobby`） |
+
+点「拉取 / 部署」，然后到面板的「进程 / 服务」里把 `ifz-lobby` 重启一次。
+
+**B. 面板只有「文件管理」**
+
+1. 浏览器打开 `https://raw.githubusercontent.com/ruoxinzhi/ifz-lobby/main/lobby_server.py`
+2. `Ctrl+A` 全选、`Ctrl+C` 复制
+3. 面板文件管理里打开服务器上的 `lobby_server.py`，全选、粘贴、保存
+4. 回面板重启该进程
+
+如果面板有「远程下载 / 从 URL 下载」，直接用它下载上面那个地址覆盖文件，更省事。
+
+**验证是否真的更新了**：浏览器打开 `http://你的域名或IP:端口/health`，
+看到 `"version": "2026-11-27.1"` 就是新版。以后每次更新我都会把这个号加一，
+看不到新号就说明文件没覆盖成功或进程没重启。
+
 ---
 
 ## 三、多台服务器
