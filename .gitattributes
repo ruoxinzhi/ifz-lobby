@@ -1,0 +1,5 @@
+# Linux 上直接执行，必须是 LF；否则 systemd 报 bad interpreter
+*.sh   text eol=lf
+*.py   text eol=lf
+*.service text eol=lf
+*.md   text eol=lf
