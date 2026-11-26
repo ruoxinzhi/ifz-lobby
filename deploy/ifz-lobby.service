@@ -1,0 +1,21 @@
+[Unit]
+Description=IFZ Lobby + Relay (Infection Free Zone co-op)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ifz-lobby
+Environment=IFZ_LOBBY_PORT=31531
+Environment=IFZ_LOBBY_DATA=/opt/ifz-lobby/rooms.json
+Environment=IFZ_RELAY_SEATS=7
+ExecStart=/usr/bin/python3 /opt/ifz-lobby/lobby_server.py
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
