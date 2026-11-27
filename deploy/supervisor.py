@@ -75,9 +75,12 @@ def read_local():
 
 
 def fetch_remote():
+    # raw.githubusercontent / jsDelivr 都有几十秒到几分钟的 CDN 缓存；带时间戳
+    # 才能「推完就生效」，否则会读到旧副本并误判为已是最新。
+    bust = int(time.time())
     for url in SOURCES:
         try:
-            with urllib.request.urlopen(url, timeout=15) as r:
+            with urllib.request.urlopen(url + "?t=%d" % bust, timeout=15) as r:
                 body = r.read()
             if version_of(body) == "?":
                 log("skip %s: no VERSION marker" % url.split("/")[2])
