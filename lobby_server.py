@@ -33,8 +33,18 @@ from urllib.parse import parse_qs, unquote, urlparse
 PORT = int(os.environ.get("IFZ_LOBBY_PORT", "8080"))
 _NOFILE = -1
 # 网页面板没有命令行时，靠这一行确认「拉到的确实是新版」：浏览器打开 /health 就能看到。
-VERSION = "2026-11-28.2"
+VERSION = "2026-11-28.3"
 DATA = os.environ.get("IFZ_LOBBY_DATA", "/root/ifz-lobby/rooms.json")
+
+# ---- 运行时遥测 ----
+# 客户端把「发生了什么」脱敏后批量发过来，这里按 天/会话 归档成 jsonl。
+# 归档目录默认放在 rooms.json 旁边，容器重建只要挂载目录在就不会丢。
+TELEMETRY_DIR = os.environ.get(
+    "IFZ_TELEMETRY_DIR", os.path.join(os.path.dirname(DATA) or ".", "telemetry"))
+TELEMETRY_MAX_BODY = int(os.environ.get("IFZ_TELEMETRY_MAX_BODY", str(160 * 1024)))
+TELEMETRY_PER_MIN = int(os.environ.get("IFZ_TELEMETRY_PER_MIN", "20"))
+TELEMETRY_KEEP_DAYS = int(os.environ.get("IFZ_TELEMETRY_KEEP_DAYS", "14"))
+TELEMETRY_MAX_SESSIONS_DAY = int(os.environ.get("IFZ_TELEMETRY_MAX_SESSIONS", "2000"))
 TTL = int(os.environ.get("IFZ_LOBBY_TTL", "90"))        # 秒无心跳即过期
 # 房间数上限按带宽反推：8 人满房约 5 Mbps，120 房远高于单机出口能力，
 # 真到瓶颈时先看 /metrics 的 mbps，而不是等房间号用完。
@@ -121,6 +131,207 @@ def _mbps_since_last():
     if dt <= 0:
         return 0.0
     return round(db * 8.0 / (dt * 1000000.0), 3)
+
+
+# ---------------------------------------------------------------- telemetry
+_tel_lock = threading.Lock()
+_tel_rate = {}
+_tel_stats = {"sessions": set(), "events": 0, "bytes": 0,
+              "rejects": {"rate": 0, "size": 0, "bad": 0}}
+_tel_cache = {"at": 0.0, "days": 0, "body": None}
+
+
+def _tel_day(offset=0):
+    return time.strftime("%Y-%m-%d", time.localtime(time.time() - offset * 86400))
+
+
+def _tel_safe_session(value):
+    """会话 id 会直接进文件名，必须是纯 hex，长度受限——否则就是路径穿越。"""
+    if not isinstance(value, str) or not 8 <= len(value) <= 64:
+        return None
+    return value if all(c in "0123456789abcdef" for c in value) else None
+
+
+def _tel_allow(ip):
+    """单 IP 每分钟 N 次。不做的话一个死循环客户端能把磁盘写满。"""
+    now = time.time()
+    with _tel_lock:
+        if len(_tel_rate) > 8000:
+            _tel_rate.clear()
+        hits = [t for t in _tel_rate.get(ip, []) if now - t < 60.0]
+        if len(hits) >= TELEMETRY_PER_MIN:
+            _tel_rate[ip] = hits
+            _tel_stats["rejects"]["rate"] += 1
+            return False
+        hits.append(now)
+        _tel_rate[ip] = hits
+        return True
+
+
+def _tel_store(session, body):
+    """按天/会话追加一行。原子追加，多台客户端并发也不会写坏。"""
+    day = _tel_day()
+    folder = os.path.join(TELEMETRY_DIR, day)
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, session + ".jsonl")
+    line = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+    with _tel_lock:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        _tel_stats["sessions"].add(day + "/" + session)
+        _tel_stats["events"] += len(body.get("events") or [])
+        _tel_stats["bytes"] += len(line)
+    return len(line)
+
+
+def _tel_prune():
+    """按天清理。只在写盘时顺带做一次，不单独开线程。"""
+    try:
+        if not os.path.isdir(TELEMETRY_DIR):
+            return
+        cutoff = _tel_day(TELEMETRY_KEEP_DAYS)
+        for name in os.listdir(TELEMETRY_DIR):
+            full = os.path.join(TELEMETRY_DIR, name)
+            if os.path.isdir(full) and name < cutoff:
+                for f in os.listdir(full):
+                    try:
+                        os.remove(os.path.join(full, f))
+                    except OSError:
+                        pass
+                try:
+                    os.rmdir(full)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
+def _tel_mask_ip(ip):
+    """服务器再擦一次 IP：客户端可能漏，而且来源地址也不该原样落盘。"""
+    parts = (ip or "").split(".")
+    if len(parts) == 4 and all(x.isdigit() for x in parts):
+        return parts[0] + "." + parts[1] + ".x.x"
+    return "v6" if ":" in (ip or "") else "?"
+
+
+def _tel_session(day, session, limit=600):
+    """取单个会话的事件流（末尾 limit 条）。用来复现某个玩家的完整一局。"""
+    path = os.path.join(TELEMETRY_DIR, day, session + ".jsonl")
+    if not os.path.isfile(path):
+        return {"ok": False, "error": "not found", "day": day, "session": session}
+    env, events, batches, ip = None, [], 0, ""
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except ValueError:
+                    continue
+                batches += 1
+                if env is None:
+                    env = payload.get("env")
+                    ip = payload.get("ip", "")
+                events.extend(payload.get("events") or [])
+    except OSError as e:
+        return {"ok": False, "error": str(e)[:120]}
+    return {"ok": True, "day": day, "session": session, "ip": ip,
+            "env": env, "batches": batches, "total": len(events),
+            "events": events[-limit:]}
+
+
+def _tel_bump(bucket, key, n=1):
+    bucket[key] = bucket.get(key, 0) + n
+
+
+def _tel_summary(days=7):
+    """把最近 N 天的归档折成一份可读分布。带 60 秒缓存，别让面板刷新打爆磁盘。"""
+    with _tel_lock:
+        if (_tel_cache["body"] is not None and _tel_cache["days"] == days
+                and time.time() - _tel_cache["at"] < 60.0):
+            return _tel_cache["body"]
+
+    out = {"ok": True, "version": VERSION, "days": days, "sessions": 0,
+           "events": 0, "errors": 0, "warns": 0,
+           "mod": {}, "os": {}, "game": {}, "lang": {}, "cores": {},
+           "event": {}, "error": {}, "drop": {},
+           "reconnect_ok": 0, "reconnect_giveup": 0,
+           "layer_zero": {}, "lobby_none": 0, "host_listen_failed": 0}
+    for i in range(days):
+        folder = os.path.join(TELEMETRY_DIR, _tel_day(i))
+        if not os.path.isdir(folder):
+            continue
+        try:
+            names = sorted(os.listdir(folder))[:TELEMETRY_MAX_SESSIONS_DAY]
+        except OSError:
+            continue
+        for name in names:
+            if not name.endswith(".jsonl"):
+                continue
+            out["sessions"] += 1
+            try:
+                with open(os.path.join(folder, name), encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            payload = json.loads(line)
+                        except ValueError:
+                            continue
+                        _tel_absorb(out, payload)
+            except OSError:
+                continue
+    with _tel_lock:
+        _tel_cache["body"] = out
+        _tel_cache["at"] = time.time()
+        _tel_cache["days"] = days
+    return out
+
+
+def _tel_absorb(out, payload):
+    env = payload.get("env") or {}
+    _tel_bump(out["mod"], str(env.get("mod", "?")))
+    _tel_bump(out["os"], str(env.get("os", "?")))
+    _tel_bump(out["game"], str(env.get("game", "?")))
+    _tel_bump(out["lang"], str(env.get("lang", "?")))
+    _tel_bump(out["cores"], str(env.get("cores", "?")))
+    net = env.get("net") or {}
+    if net.get("fail"):
+        out.setdefault("link_fail_total", 0)
+        out["link_fail_total"] += int(net["fail"])
+
+    for ev in payload.get("events") or []:
+        cat = str(ev.get("cat", "?"))
+        name = str(ev.get("ev", "?"))
+        key = cat + "." + name
+        out["events"] += 1
+        _tel_bump(out["event"], key)
+        lvl = ev.get("lvl")
+        if lvl == "error":
+            out["errors"] += 1
+            _tel_bump(out["error"], key)
+        elif lvl == "warn":
+            out["warns"] += 1
+        if cat == "net" and name == "drop":
+            fields = ev.get("f") or {}
+            _tel_bump(out["drop"], str(fields.get("phase", "?")) + ":" +
+                      str(fields.get("reason", "?"))[:40])
+        elif cat == "net" and name == "reconnect.ok":
+            out["reconnect_ok"] += 1
+        elif cat == "net" and name == "reconnect.gave-up":
+            out["reconnect_giveup"] += 1
+        elif cat == "net" and name == "host.listen-failed":
+            out["host_listen_failed"] += 1
+        elif cat == "lobby" and name == "register.none":
+            out["lobby_none"] += 1
+        elif cat == "layer" and name == "applied":
+            fields = ev.get("f") or {}
+            for k, v in fields.items():
+                if isinstance(v, int) and v == 0 and k not in ("menu",):
+                    _tel_bump(out["layer_zero"], k)
 
 
 def _now():
@@ -330,6 +541,50 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _telemetry(self):
+        """POST /api/telemetry。
+
+        单独一条读取路径：通用 _body() 的上限是 8KB，遥测一批最多 160KB。
+        校验从严——session 进文件名、events 进 JSON 解析、IP 二次脱敏。
+        """
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            n = 0
+        if n <= 0:
+            return self._send({"ok": False, "error": "empty body"}, 400)
+        if n > TELEMETRY_MAX_BODY:
+            _tel_stats["rejects"]["size"] += 1
+            return self._send({"ok": False, "error": "too large"}, 413)
+
+        ip = self._origin_ip({})
+        if not _tel_allow(ip):
+            return self._send({"ok": False, "error": "slow down"}, 429)
+        try:
+            body = json.loads(self.rfile.read(n).decode("utf-8"))
+        except Exception:
+            _tel_stats["rejects"]["bad"] += 1
+            return self._send({"ok": False, "error": "bad json"}, 400)
+        if not isinstance(body, dict):
+            _tel_stats["rejects"]["bad"] += 1
+            return self._send({"ok": False, "error": "bad payload"}, 400)
+
+        session = _tel_safe_session(body.get("session"))
+        if session is None:
+            _tel_stats["rejects"]["bad"] += 1
+            return self._send({"ok": False, "error": "bad session"}, 400)
+        events = body.get("events")
+        if not isinstance(events, list) or len(events) > 2000:
+            _tel_stats["rejects"]["bad"] += 1
+            return self._send({"ok": False, "error": "bad events"}, 400)
+
+        # 二次脱敏：客户端已经擦过一遍，但服务器不能假设客户端可信。
+        body["ip"] = _tel_mask_ip(ip)
+        body["recv"] = _now()
+        _tel_store(session, body)
+        _tel_prune()
+        return self._send({"ok": True, "stored": len(events)})
+
     def _body(self):
         try:
             n = int(self.headers.get("Content-Length", "0"))
@@ -403,6 +658,28 @@ class Handler(BaseHTTPRequestHandler):
                 "nofile": _NOFILE,
                 "threads": threading.active_count(),
             })
+        if path == "/api/telemetry/summary":
+            days = parse_qs(u.query).get("days", ["7"])[0]
+            try:
+                days = max(1, min(30, int(days)))
+            except ValueError:
+                days = 7
+            return self._send(_tel_summary(days))
+        if path == "/api/telemetry/stats":
+            with _tel_lock:
+                snap = dict(_tel_stats)
+                snap["sessions"] = len(snap["sessions"])
+                snap["dir"] = TELEMETRY_DIR
+            return self._send({"ok": True, "version": VERSION,
+                               "today": _tel_day(0), **snap})
+        if path.startswith("/api/telemetry/"):
+            session = _tel_safe_session(path.rsplit("/", 1)[-1])
+            if session is None:
+                return self._send({"ok": False, "error": "bad session"}, 400)
+            day = parse_qs(u.query).get("day", [""])[0] or _tel_day(0)
+            if len(day) != 10 or not day.replace("-", "").isdigit():
+                return self._send({"ok": False, "error": "bad day"}, 400)
+            return self._send(_tel_session(day, session))
         if path == "/api/relay":
             # 客人选台用：这个房间在本台还有几个空座位。只读，不加锁住状态。
             room = (parse_qs(u.query).get("room", [""])[0] or "").strip().upper()
@@ -448,6 +725,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         u = urlparse(self.path)
         path = u.path
+
+        # 遥测要单独读：通用 _body() 只收 8KB，一批事件最多 160KB。
+        if path == "/api/telemetry":
+            return self._telemetry()
+
         body = self._body()
 
         if path == "/api/room":
