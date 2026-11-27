@@ -9,6 +9,9 @@ WorkingDirectory=/opt/ifz-lobby
 Environment=IFZ_LOBBY_PORT=31531
 Environment=IFZ_LOBBY_DATA=/opt/ifz-lobby/rooms.json
 Environment=IFZ_RELAY_SEATS=7
+Environment=IFZ_LOBBY_MAX=120
+Environment=IFZ_LOBBY_MAX_PER_IP=8
+LimitNOFILE=65535
 ExecStart=/usr/bin/python3 /opt/ifz-lobby/lobby_server.py
 Restart=always
 RestartSec=3

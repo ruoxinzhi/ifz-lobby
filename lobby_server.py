@@ -30,12 +30,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
 PORT = int(os.environ.get("IFZ_LOBBY_PORT", "8080"))
+_NOFILE = -1
 # 网页面板没有命令行时，靠这一行确认「拉到的确实是新版」：浏览器打开 /health 就能看到。
-VERSION = "2026-11-27.2"
+VERSION = "2026-11-28.1"
 DATA = os.environ.get("IFZ_LOBBY_DATA", "/root/ifz-lobby/rooms.json")
 TTL = int(os.environ.get("IFZ_LOBBY_TTL", "90"))        # 秒无心跳即过期
-MAX_ROOMS = int(os.environ.get("IFZ_LOBBY_MAX", "200"))
-MAX_PER_IP = 3
+# 房间数上限按带宽反推：8 人满房约 5 Mbps，120 房远高于单机出口能力，
+# 真到瓶颈时先看 /metrics 的 mbps，而不是等房间号用完。
+MAX_ROOMS = int(os.environ.get("IFZ_LOBBY_MAX", "120"))
+# 网吧/校园网/公司共用出口 IP：3 间太紧，公开后第一批投诉就是这个。默认 8。
+MAX_PER_IP = int(os.environ.get("IFZ_LOBBY_MAX_PER_IP", "8"))
 MAX_NAME = 24
 # 去掉 O/0/I/1 等易混字符
 CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -53,6 +57,69 @@ _lock = threading.RLock()
 _rooms = {}      # code -> {name, token, ip, port, city, players, updated, steam, relay}
 _relay_rooms = {}          # relay 码 -> {"hosts":[MAX_RELAY_GUESTS 个房主隧道], "pairs":[(host,guest)], "created":ts}
 _relay_lock = threading.Lock()
+
+# ---- 运行指标：只做累加，读的时候加锁，不上报、不写盘 ----
+_stats_lock = threading.Lock()
+_stats = {
+    "since": time.time(),
+    "bytes": 0,
+    "tunnels": 0,
+    "pairs": 0,
+    "reject_full": 0,
+    "reject_ip": 0,
+    "reject_bad": 0,
+    "registrations": 0,
+}
+_metrics_last = {"ts": time.time(), "bytes": 0}
+
+
+def _count(key, n=1):
+    with _stats_lock:
+        _stats[key] = _stats.get(key, 0) + n
+
+
+def _note_bytes(n):
+    with _stats_lock:
+        _stats["bytes"] += n
+
+
+def _raise_nofile():
+    """每个中转客人占 2 个 socket，默认 1024 撑不到 500 人。启动时顶到 65535。"""
+    try:
+        import resource
+        want = int(os.environ.get("IFZ_NOFILE", "65535"))
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = want if hard == resource.RLIM_INFINITY else min(want, hard)
+        if soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        return resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    except Exception:
+        return -1
+
+
+def _gauge():
+    """现算的瞬时量：房间、中转房间、已配对客人、可用座位。"""
+    with _lock:
+        rooms = len(_rooms)
+    with _relay_lock:
+        relay_rooms = len(_relay_rooms)
+        pairs = sum(len(st["pairs"]) for st in _relay_rooms.values())
+        free = sum(1 for st in _relay_rooms.values()
+                   for h in st["hosts"] if h is None or not h.paired)
+    return rooms, relay_rooms, pairs, free
+
+
+def _mbps_since_last():
+    """上一次抓取至今的平均速率。抓取方按固定间隔拉，就能得到真实曲线。"""
+    with _stats_lock:
+        now = time.time()
+        dt = now - _metrics_last["ts"]
+        db = _stats["bytes"] - _metrics_last["bytes"]
+        _metrics_last["ts"] = now
+        _metrics_last["bytes"] = _stats["bytes"]
+    if dt <= 0:
+        return 0.0
+    return round(db * 8.0 / (dt * 1000000.0), 3)
 
 
 def _now():
@@ -226,6 +293,7 @@ def _relay_pump(src, dst):
             data = src.conn.recv(65536)
             if not data:
                 break
+            _note_bytes(len(data))
             dst.send(data)
     except Exception:
         pass
@@ -306,8 +374,34 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             with _lock:
                 _prune_locked()
-                return self._send({"ok": True, "version": VERSION, "rooms": len(_rooms),
-                                   "ttl": TTL, "max_rooms": MAX_ROOMS})
+            rooms, relay_rooms, pairs, _free = _gauge()
+            return self._send({"ok": True, "version": VERSION, "rooms": rooms,
+                               "relay_rooms": relay_rooms, "pairs": pairs,
+                               "ttl": TTL, "max_rooms": MAX_ROOMS})
+        if path == "/metrics":
+            with _lock:
+                _prune_locked()
+            rooms, relay_rooms, pairs, free = _gauge()
+            mbps = _mbps_since_last()
+            with _stats_lock:
+                snap = dict(_stats)
+                uptime = int(time.time() - snap["since"])
+            return self._send({
+                "ok": True, "version": VERSION, "uptime_sec": uptime,
+                "rooms": rooms, "relay_rooms": relay_rooms,
+                "pairs": pairs, "free_seats": free,
+                "mbps_since_last": mbps,
+                "bytes_relayed": snap["bytes"],
+                "tunnels_opened": snap["tunnels"],
+                "pairs_made": snap["pairs"],
+                "registrations": snap["registrations"],
+                "rejects": {"full": snap["reject_full"], "ip": snap["reject_ip"],
+                            "bad": snap["reject_bad"]},
+                "limits": {"max_rooms": MAX_ROOMS, "max_per_ip": MAX_PER_IP,
+                           "seats": MAX_RELAY_GUESTS},
+                "nofile": _NOFILE,
+                "threads": threading.active_count(),
+            })
         if path == "/api/relay":
             # 客人选台用：这个房间在本台还有几个空座位。只读，不加锁住状态。
             room = (parse_qs(u.query).get("room", [""])[0] or "").strip().upper()
@@ -359,16 +453,20 @@ class Handler(BaseHTTPRequestHandler):
             name = _clean_name(body.get("name"))
             port = body.get("port")
             if not name:
+                _count("reject_bad")
                 return self._send({"ok": False, "error": "empty room name"}, 400)
             if not _valid_port(port):
+                _count("reject_bad")
                 return self._send({"ok": False, "error": "bad port"}, 400)
             ip = self._origin_ip(body)
             with _lock:
                 _prune_locked()
                 mine = [c for c, r in _rooms.items() if r["ip"] == ip]
                 if len(_rooms) >= MAX_ROOMS:
+                    _count("reject_full")
                     return self._send({"ok": False, "error": "lobby full"}, 503)
                 if len(mine) >= MAX_PER_IP:
+                    _count("reject_ip")
                     return self._send({"ok": False, "error": "too many rooms from this ip"}, 429)
                 code = _new_code_locked()
                 token = secrets.token_hex(16)
@@ -384,6 +482,7 @@ class Handler(BaseHTTPRequestHandler):
                     "updated": _now(),
                 }
                 _save_locked()
+            _count("registrations")
             print("[lobby] register " + code + " " + name + " " + ip + ":" + str(port), flush=True)
             return self._send({"ok": True, "code": code, "token": token,
                                "ip": ip, "port": port, "ttl": TTL})
@@ -443,6 +542,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.flush()
         peer = RelayPeer(self.connection, self.client_address, role, room)
+        _count("tunnels")
         if role == "host":
             with _relay_lock:
                 st = _relay_rooms.get(room)
@@ -480,6 +580,7 @@ class Handler(BaseHTTPRequestHandler):
                 peer.close_quiet()
                 return
             st["pairs"].append((host_peer, peer))
+        _count("pairs")
         _relay_pair(host_peer, peer)
         print("[relay] guest paired slot %d in %s from %s"
               % (slot, room, self.client_address[0]), flush=True)
@@ -507,9 +608,12 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     _load()
+    global _NOFILE
+    _NOFILE = _raise_nofile()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     srv.daemon_threads = True
-    print("IFZ lobby listening on 0.0.0.0:%d | ttl=%ds | data=%s" % (PORT, TTL, DATA), flush=True)
+    print("IFZ lobby %s listening on 0.0.0.0:%d | ttl=%ds | rooms<=%d | per-ip<=%d | seats=%d | nofile=%s | data=%s"
+          % (VERSION, PORT, TTL, MAX_ROOMS, MAX_PER_IP, MAX_RELAY_GUESTS, _NOFILE, DATA), flush=True)
     try:
         srv.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:

@@ -166,5 +166,25 @@ CONNECT host:port                      中转隧道
 ```
 
 环境变量：`IFZ_LOBBY_PORT`（默认 8080）、`IFZ_LOBBY_DATA`（rooms.json 路径）、
-`IFZ_LOBBY_TTL`（默认 90 秒）、`IFZ_LOBBY_MAX`（默认 200 间）、
-`IFZ_RELAY_SEATS`（每台预留中转座位，默认 7）。
+`IFZ_LOBBY_TTL`（默认 90 秒）、`IFZ_LOBBY_MAX`（默认 120 间）、
+`IFZ_LOBBY_MAX_PER_IP`（单 IP 房间数，默认 8；网吧/校园网共用出口时调大）、
+`IFZ_RELAY_SEATS`（每台预留中转座位，默认 7）、`IFZ_NOFILE`（默认 65535）。
+
+## 八、容量与监控
+
+`GET /metrics` 返回实时指标，用于判断该不该加机器：
+
+```json
+{"rooms":12,"relay_rooms":8,"pairs":31,"free_seats":25,"mbps_since_last":42.1,
+ "bytes_relayed":123456789,"tunnels_opened":240,"pairs_made":180,
+ "rejects":{"full":0,"ip":2,"bad":0},
+ "limits":{"max_rooms":120,"max_per_ip":8,"seats":7},
+ "nofile":65535,"threads":96}
+```
+
+- `mbps_since_last` 是「上次抓取至今」的平均速率，按固定间隔拉就是真实曲线
+- `free_seats` 为 0 表示这台已经接不下新客人，客人会自动换另一台
+- `rejects.ip` 持续增长说明单 IP 上限太紧；`rejects.full` 说明房间数到顶
+
+单台 1 vCPU / 1 GB 的经验值：约 200 人为宜，600 人开始吃紧。
+带宽和单核是瓶颈，不是内存。
