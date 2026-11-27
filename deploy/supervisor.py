@@ -32,7 +32,7 @@ TARGET = os.path.join(ROOT, "lobby_server.py")
 BACKUP = TARGET + ".bak"
 LOG = os.path.join(ROOT, "supervisor.log")
 
-PORT = int(os.environ.get("IFZ_LOBBY_PORT", "31531"))
+PORT = int(os.environ.get("IFZ_LOBBY_PORT") or os.environ.get("PORT") or "31531")
 CHECK_SECS = int(os.environ.get("IFZ_AUTOUPDATE_SECS", "600"))
 
 REPO = "ruoxinzhi/ifz-lobby"
