@@ -148,7 +148,19 @@ def reap_orphans():
             continue
         if b"lobby_server.py" not in raw:
             continue
+        # 只收「父进程已经是 init」的孤儿。父进程还活着的进程有人在管，
+        # 贸然杀掉会让正在服务的实例断线；而且 2026-11-27 那次在多孤儿
+        # 场景下惊到过一次，收紧匹配比事后排查便宜。
+        try:
+            with open("/proc/%d/stat" % pid, "rb") as f:
+                stat = f.read()
+            tail = stat[stat.rfind(b")") + 2:].split()
+            if int(tail[1]) != 1:
+                continue
+        except Exception:
+            continue
         victims.append(pid)
+    log("orphan scan: %d candidate(s)" % len(victims))
     for pid in victims:
         try:
             os.kill(pid, signal.SIGTERM)
