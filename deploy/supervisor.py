@@ -473,7 +473,9 @@ def main():
                 continue
             local = read_local()
             if digest(body) == digest(local):
-                log("check: up to date (%s)" % version_of(local))
+                # 打印来源：如果远端明明发了新版、这里却还说 up to date，
+                # 就说明兜底源给的是旧缓存（2026-11-27 那次 jsDelivr 就干过）。
+                log("check: up to date (%s) via %s" % (version_of(local), url.split("/")[2]))
                 continue
             if is_downgrade(version_of(body), version_of(local)):
                 if os.environ.get("IFZ_ALLOW_DOWNGRADE") == "1":
