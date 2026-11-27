@@ -65,12 +65,16 @@ REPO = "ruoxinzhi/ifz-lobby"
 # 匿名额度 60 次/小时，按 10 分钟一轮是 6 次，够用。剩下两个只在 API 失败时兜底。
 API_URL = ("https://api.github.com/repos/%s/contents/lobby_server.py?ref=main" % REPO,
            {"Accept": "application/vnd.github.raw", "User-Agent": "ifz-supervisor"})
+# 顺序很关键：jsDelivr 对 @main 的长缓存实测落后过两个版本，2026-11-27 那次
+# 就是它在 API 限流后把线上改回了旧版。raw 的缓存只有几分钟，所以它排前面；
+# jsDelivr 放到最后，仅在版本确实更高时才会被采用（见 is_downgrade）。
 CDN_URLS = (
-    "https://cdn.jsdelivr.net/gh/%s@main/lobby_server.py?v=%%d" % REPO,
     "https://raw.githubusercontent.com/%s/main/lobby_server.py?v=%%d" % REPO,
+    "https://cdn.jsdelivr.net/gh/%s@main/lobby_server.py?v=%%d" % REPO,
 )
 
 VERSION_RE = re.compile(rb'^VERSION = "([^"]+)"', re.M)
+VERSION_PARTS = re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?:\.(\d+))?$")
 STARTUP_GRACE = 15.0       # 启动后多久内必须能返回 /health
 HEALTH_FAILS = 3           # 连续几次探活失败才重启（防一次网络抖动误杀）
 
@@ -164,6 +168,24 @@ def reap_orphans():
 def version_of(data):
     m = VERSION_RE.search(data or b"")
     return m.group(1).decode() if m else "?"
+
+
+def version_key(text):
+    """把 2026-11-28.2 变成可比较的元组；格式不认识就返回 None。"""
+    m = VERSION_PARTS.match((text or "").strip())
+    if not m:
+        return None
+    y, mo, d, n = m.groups()
+    return (int(y), int(mo), int(d), int(n or 0))
+
+
+def is_downgrade(remote_text, local_text):
+    """远端比本地旧就算降级。CDN 旧缓存只能用这个办法挡住。"""
+    r, l = version_key(remote_text), version_key(local_text)
+    if r is None or l is None:
+        return False          # 格式不认识就不拦，只记日志
+    # 相等但内容不同是允许的（同版本修 bug），只拦「远端更旧」。
+    return r < l
 
 
 def digest(data):
@@ -453,6 +475,15 @@ def main():
             if digest(body) == digest(local):
                 log("check: up to date (%s)" % version_of(local))
                 continue
+            if is_downgrade(version_of(body), version_of(local)):
+                if os.environ.get("IFZ_ALLOW_DOWNGRADE") == "1":
+                    log("downgrade allowed by IFZ_ALLOW_DOWNGRADE: %s -> %s"
+                        % (version_of(local), version_of(body)))
+                else:
+                    log("refuse downgrade: remote %s <= local %s (probably a stale "
+                        "CDN copy); set IFZ_ALLOW_DOWNGRADE=1 to force"
+                        % (version_of(body), version_of(local)))
+                    continue
             log("check: remote %s != local %s, updating"
                 % (version_of(body), version_of(local)))
             deploy_and_verify(body, url, child)

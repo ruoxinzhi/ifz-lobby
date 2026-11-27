@@ -71,7 +71,25 @@ def kill(pid, verbose=False):
             pass
 
 
+def supervisor_module():
+    """只加载函数，不启动任何进程。"""
+    import importlib.util
+    path = os.path.join(ROOT, "deploy", "supervisor.py")
+    spec = importlib.util.spec_from_file_location("ifz_supervisor", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def main():
+    sup = supervisor_module()
+    check("更旧的 CDN 副本被判为降级", sup.is_downgrade("2026-11-27.2", "2026-11-28.2"),
+          "jsDelivr 曾经在限流后把线上改回旧版")
+    check("更高版本不算降级", not sup.is_downgrade("2026-11-28.3", "2026-11-28.2"))
+    check("同版本不算降级", not sup.is_downgrade("2026-11-28.2", "2026-11-28.2"),
+          "同版本改 bug 仍应能部署")
+    check("版本号格式不认识时不拦", not sup.is_downgrade("weird", "2026-11-28.2"))
+
     tmp = tempfile.mkdtemp(prefix="ifz-keepalive-")
     try:
         for rel in ("main.py", "lobby_server.py", os.path.join("deploy", "supervisor.py")):
