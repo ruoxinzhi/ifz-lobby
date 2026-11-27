@@ -101,6 +101,36 @@ curl -s http://127.0.0.1:31531/health
 
 ---
 
+## 六、没有 systemd / cron 的容器
+
+有些云主机只是个容器：`systemctl`、`crontab`、`git` 全没有，只有 `python3`。
+这种用 `deploy/supervisor.py`，它自己就是守护进程 + 更新器：
+
+```sh
+cd /opt/ifz-lobby
+sh deploy/start.sh          # 后台常驻（幂等，重复执行不会起两份）
+```
+
+它做三件事：
+
+1. `lobby_server.py` 挂了自动拉起（崩溃、OOM、误 kill）
+2. 每 10 分钟比对 GitHub 上文件的 sha256，变了才替换并重启
+3. 新版本 15 秒内起不来 → 自动回滚到上一份
+
+日志在 `supervisor.log` 和 `lobby.log`，浏览器看 `http://IP:端口/health`
+的 `version` 就知道当前跑的是哪版。
+
+**开机自启**：容器没有 systemd/cron，只能靠面板。在面板的「启动命令 / 开机任务」
+里填这一句即可（只需设置一次）：
+
+```sh
+sh /opt/ifz-lobby/deploy/start.sh
+```
+
+关闭自更新：`IFZ_AUTOUPDATE_SECS=0`。
+
+---
+
 ## 五、接口（排错用）
 
 ```
