@@ -31,7 +31,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 PORT = int(os.environ.get("IFZ_LOBBY_PORT", "8080"))
 # 网页面板没有命令行时，靠这一行确认「拉到的确实是新版」：浏览器打开 /health 就能看到。
-VERSION = "2026-11-27.1"
+VERSION = "2026-11-27.2"
 DATA = os.environ.get("IFZ_LOBBY_DATA", "/root/ifz-lobby/rooms.json")
 TTL = int(os.environ.get("IFZ_LOBBY_TTL", "90"))        # 秒无心跳即过期
 MAX_ROOMS = int(os.environ.get("IFZ_LOBBY_MAX", "200"))
