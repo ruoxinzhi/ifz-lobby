@@ -35,9 +35,15 @@ LOG = os.path.join(ROOT, "supervisor.log")
 PORT = int(os.environ.get("IFZ_LOBBY_PORT", "31531"))
 CHECK_SECS = int(os.environ.get("IFZ_AUTOUPDATE_SECS", "600"))
 
-SOURCES = (
-    "https://raw.githubusercontent.com/ruoxinzhi/ifz-lobby/main/lobby_server.py",
-    "https://cdn.jsdelivr.net/gh/ruoxinzhi/ifz-lobby@main/lobby_server.py",
+REPO = "ruoxinzhi/ifz-lobby"
+# raw.githubusercontent 和 jsDelivr 都走 CDN，查询参数绕不过去（实测 ?t= 无效，
+# 会读到几分钟前的旧副本）。GitHub Contents API 才是即时的，所以它排第一；
+# 匿名额度 60 次/小时，按 10 分钟一轮是 6 次，够用。剩下两个只在 API 失败时兜底。
+API_URL = ("https://api.github.com/repos/%s/contents/lobby_server.py?ref=main" % REPO,
+           {"Accept": "application/vnd.github.raw", "User-Agent": "ifz-supervisor"})
+CDN_URLS = (
+    "https://cdn.jsdelivr.net/gh/%s@main/lobby_server.py?v=%%d" % REPO,
+    "https://raw.githubusercontent.com/%s/main/lobby_server.py?v=%%d" % REPO,
 )
 
 VERSION_RE = re.compile(rb'^VERSION = "([^"]+)"', re.M)
@@ -75,12 +81,13 @@ def read_local():
 
 
 def fetch_remote():
-    # raw.githubusercontent / jsDelivr 都有几十秒到几分钟的 CDN 缓存；带时间戳
-    # 才能「推完就生效」，否则会读到旧副本并误判为已是最新。
-    bust = int(time.time())
-    for url in SOURCES:
+    stamp = int(time.time())
+    candidates = [(API_URL[0], API_URL[1])]
+    candidates += [(u % stamp, {}) for u in CDN_URLS]
+    for url, headers in candidates:
         try:
-            with urllib.request.urlopen(url + "?t=%d" % bust, timeout=15) as r:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as r:
                 body = r.read()
             if version_of(body) == "?":
                 log("skip %s: no VERSION marker" % url.split("/")[2])
