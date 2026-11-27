@@ -101,7 +101,7 @@ curl -s http://127.0.0.1:31531/health
 
 ---
 
-## 六、没有 systemd / cron 的容器
+## 五、没有 systemd / cron 的容器
 
 有些云主机只是个容器：`systemctl`、`crontab`、`git` 全没有，只有 `python3`。
 这种用 `deploy/supervisor.py`，它自己就是守护进程 + 更新器：
@@ -131,7 +131,30 @@ sh /opt/ifz-lobby/deploy/start.sh
 
 ---
 
-## 五、接口（排错用）
+## 六、Pterodactyl / NobleHost 这类面板
+
+启动命令长这样，`PY_FILE` 默认就是 `main.py`：
+
+```sh
+... /usr/local/bin/python /home/container/${PY_FILE}
+```
+
+常见报错 `can't open file '/home/container/main.py'`，原因是**面板目录里还没有仓库文件**。
+
+只需要把 `main.py` 放进 `/home/container/`（SFTP 或面板文件管理），点启动即可：
+
+1. `main.py` 发现 `lobby_server.py` / `deploy/supervisor.py` 不存在，会自己从 GitHub 下载
+2. 然后交给 supervisor 常驻
+3. 端口取 `SERVER_PORT`（面板分配）→ `IFZ_LOBBY_PORT` → `31531`
+
+面板里的 `AUTO_UPDATE` 变量**不用开**：它只在存在 `.git` 时执行 `git pull`，而本项目的
+更新由 supervisor 自己完成，不依赖 git。
+
+验证：浏览器打开 `http://面板给的地址:端口/health`，`version` 有值就是活的。
+
+---
+
+## 七、接口（排错用）
 
 ```
 GET    /health                         服务状态
