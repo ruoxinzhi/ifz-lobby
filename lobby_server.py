@@ -22,6 +22,7 @@ import json
 import os
 import secrets
 import select
+import signal
 import socket
 import sys
 import threading
@@ -32,7 +33,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 PORT = int(os.environ.get("IFZ_LOBBY_PORT", "8080"))
 _NOFILE = -1
 # 网页面板没有命令行时，靠这一行确认「拉到的确实是新版」：浏览器打开 /health 就能看到。
-VERSION = "2026-11-28.1"
+VERSION = "2026-11-28.2"
 DATA = os.environ.get("IFZ_LOBBY_DATA", "/root/ifz-lobby/rooms.json")
 TTL = int(os.environ.get("IFZ_LOBBY_TTL", "90"))        # 秒无心跳即过期
 # 房间数上限按带宽反推：8 人满房约 5 Mbps，120 房远高于单机出口能力，
@@ -606,7 +607,53 @@ class Handler(BaseHTTPRequestHandler):
         return self._send({"ok": True, "code": code})
 
 
+HANDOFF_MARK = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".supervisor-handoff")
+
+
+def _handoff_to_new_supervisor():
+    """从 v1 守护平滑迁移到 v2（只会在升级的那一瞬间命中一次）。
+
+    v1 的入口不会重启自己，所以换了 supervisor.py 也得等面板重启才生效。
+    这里做一次交接：新大厅进程发现「自己是被老守护拉起来的」（环境里没有
+    IFZ_SUPERVISOR_VERSION=2），而磁盘上的 supervisor.py 已经是 v2，就让
+    老守护退出、自己也退出。面板 daemon 看到主进程结束会重启容器，届时
+    新 entry + 新守护一起加载。
+
+    干净环境里 main.py 已经把变量设成 2，所以永远不会走到这里。
+    """
+    if os.environ.get("IFZ_SUPERVISOR_VERSION") == "2":
+        return
+    if os.environ.get("IFZ_AUTO_HANDOFF", "1") == "0":
+        return
+    sup = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deploy", "supervisor.py")
+    try:
+        with open(sup, "rb") as f:
+            blob = f.read()
+    except Exception:
+        return
+    if b'SUPERVISOR_VERSION = "2"' not in blob:
+        return
+    try:
+        if os.path.exists(HANDOFF_MARK):
+            return          # 已经交接过，别反复折腾
+        with open(HANDOFF_MARK, "w", encoding="utf-8") as f:
+            f.write(str(int(time.time())))
+    except Exception:
+        pass
+    ppid = os.getppid()
+    print("[lobby] old supervisor detected (v1); handing over to v2: "
+          "parent pid=%d will be stopped, panel restarts the container" % ppid, flush=True)
+    try:
+        if ppid > 1:
+            os.kill(ppid, signal.SIGTERM)
+    except Exception as e:
+        print("[lobby] cannot signal parent: %s" % e, flush=True)
+    time.sleep(1.0)
+    os._exit(0)
+
+
 def main():
+    _handoff_to_new_supervisor()
     _load()
     global _NOFILE
     _NOFILE = _raise_nofile()

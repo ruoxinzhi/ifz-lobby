@@ -1,6 +1,15 @@
 rooms.json
 *.log
+*.log.1
 __pycache__/
 *.pyc
 .env
 .tmp-boot/
+
+# 运行时产物：守护进程自己生成，别提交
+.supervisor.heartbeat
+.supervisor.heartbeat.tmp
+.supervisor.lock
+.supervisor-handoff
+lobby_server.py.bak
+lobby_server.py.new

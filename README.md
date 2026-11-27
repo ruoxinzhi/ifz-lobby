@@ -111,14 +111,30 @@ cd /opt/ifz-lobby
 sh deploy/start.sh          # 后台常驻（幂等，重复执行不会起两份）
 ```
 
-它做三件事：
+它做这些事：
 
 1. `lobby_server.py` 挂了自动拉起（崩溃、OOM、误 kill）
 2. 每 10 分钟比对 GitHub 上文件的 sha256，变了才替换并重启
-3. 新版本 15 秒内起不来 → 自动回滚到上一份
+3. 新版本 15 秒内出不了 `/health` → 自动回滚到上一份
+4. **探活不是只看端口**：定时 GET `/health`，连续 3 次拿不到 `ok:true` 就重启
+   （进程卡死、线程全堵时 TCP 照样能握手，只看端口发现不了）
+5. 子进程内存超过 `IFZ_MAX_RSS_MB`（默认 384MB）主动重启，避免被 OOM killer
+   干掉后触发面板的崩溃保护冷却
+6. 启动时 `flock` 单实例锁 + 清掉上次遗留的孤儿进程，防止抢端口死循环
 
 日志在 `supervisor.log` 和 `lobby.log`，浏览器看 `http://IP:端口/health`
 的 `version` 就知道当前跑的是哪版。
+
+**怎么确认守护还活着**：面板「文件管理」里看 `.supervisor.heartbeat`，
+每 30 秒刷新一次，内容是这样的：
+
+```json
+{"ts":"2026-11-27 22:24:05","supervisor_pid":5200,"supervisor_version":"2",
+ "child_pid":2516,"child_alive":true,"child_rss_mb":41.2,
+ "version":"2026-11-28.2","port":31531}
+```
+
+`ts` 不走了就是守护没了；`child_alive:false` 说明正在重启大厅。
 
 **开机自启**：容器没有 systemd/cron，只能靠面板。在面板的「启动命令 / 开机任务」
 里填这一句即可（只需设置一次）：
@@ -151,6 +167,34 @@ sh /opt/ifz-lobby/deploy/start.sh
 更新由 supervisor 自己完成，不依赖 git。
 
 验证：浏览器打开 `http://面板给的地址:端口/health`，`version` 有值就是活的。
+
+### 保活三层
+
+面板只看得见一个进程（`python main.py`）。它一退出，面板就进入「崩溃保护」，
+60 秒内不再自动重启。所以这三层是这样分工的：
+
+| 层 | 负责 | 挂掉的后果 |
+|---|---|---|
+| `main.py` | 永不退出；supervisor 崩了 5 秒内原地重起 | 面板看到进程结束 → 崩溃保护 |
+| `deploy/supervisor.py` | 盯大厅进程：端口不响应、内存超标、进程死 | 大厅没人管 |
+| `lobby_server.py` | 启动时自抬 fd 上限，正常服务 | 功能异常 |
+
+`main.py` 的退避是 5 → 10 → 20 → 40 → 60 秒封顶；一旦某个守护活过 120 秒，
+退避重置回 5 秒。**它只在收到 SIGTERM/SIGINT 时才真的退出**，所以面板点 Stop
+仍然是正常停服。
+
+### 从旧版升级（v1 守护 → v2）
+
+`supervisor.py` 不会更新自己（它只盯 `lobby_server.py`）。为了不用上服务器手动重启，
+新大厅进程会做一次**自动交接**：
+
+1. 新 `lobby_server.py` 启动时检查环境变量 `IFZ_SUPERVISOR_VERSION`
+2. 如果磁盘上的守护已是 v2、但环境里没有这个标记（说明父进程还是 v1）
+3. 就写 `.supervisor-handoff`、让父进程退出、自己也退出
+4. 面板检测到主进程结束 → 重启容器 → 新 `main.py` + 新守护一起生效
+
+只命中一次：干净环境里 `main.py` 一开始就设了标记。
+关掉它：`IFZ_AUTO_HANDOFF=0`。代价是升级那一次会有几十秒服务中断。
 
 ---
 
