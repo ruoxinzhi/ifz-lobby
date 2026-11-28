@@ -8,6 +8,7 @@
 纯 Python 标准库，无第三方依赖。接口：
 
     GET  /health                       -> {"ok":true,"rooms":N,...}
+    GET  /api/servers                  -> 节点列表下发（客户端只内置一个引导地址）
     POST /api/room                     -> 注册，返回 {"code","token","ip","port",...}
     POST /api/room/<code>/heartbeat    -> 保活（需 token）
     DELETE /api/room/<code>?token=...  -> 注销（需 token）
@@ -35,7 +36,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 PORT = int(os.environ.get("IFZ_LOBBY_PORT", "8080"))
 _NOFILE = -1
 # 网页面板没有命令行时，靠这一行确认「拉到的确实是新版」：浏览器打开 /health 就能看到。
-VERSION = "2026-11-28.4"
+VERSION = "2026-11-28.5"
 DATA = os.environ.get("IFZ_LOBBY_DATA", "/root/ifz-lobby/rooms.json")
 
 # ---- 运行时遥测 ----
@@ -72,6 +73,86 @@ def _admin_token():
         pass
     return ""
 ADMIN_LOG_LINES_MAX = 2000
+
+
+# ---- 节点列表下发 ----
+# 玩家客户端只内置一个「引导地址」，真正有哪些大厅由这里说了算。加一台机器＝改
+# servers.json，不用重新编译客户端、不用发版，也不用管玩家本地那份 modpack.json。
+# 文件缺失或写坏了就回退到 DEFAULT_SERVERS：下发故障不该让人开不了房。
+SERVERS_FILE = os.environ.get(
+    "IFZ_SERVERS_FILE", os.path.join(os.path.dirname(DATA) or ".", "servers.json"))
+DEFAULT_SERVERS = [
+    "http://host.noblehost.cc:30811",
+    "http://de3.nodaroo.fun:28068",
+]
+# 条数和长度都限死：玩家端会照单全收，一份被塞了垃圾的列表不该拖慢启动。
+MAX_SERVERS = 8
+MAX_SERVER_URL = 200
+# 客户端缓存多久（秒）。给的是保守值，改列表不用等它过期——客户端会后台刷新。
+SERVER_LIST_TTL = 3600
+
+_servers_lock = threading.Lock()
+_servers_cache = {"stamp": None, "list": list(DEFAULT_SERVERS)}
+
+
+def _clean_server_url(u):
+    """只接受 http/https 的绝对地址。空白、引号、尖括号一律拒绝。"""
+    if not isinstance(u, str):
+        return None
+    u = u.strip().rstrip("/")
+    if not u or len(u) > MAX_SERVER_URL:
+        return None
+    for ch in " \t\r\n\"'<>\\":
+        if ch in u:
+            return None
+    low = u.lower()
+    for scheme in ("http://", "https://"):
+        if low.startswith(scheme):
+            return u if len(u) > len(scheme) else None
+    return None
+
+
+def _servers_list():
+    """读 servers.json（按 mtime 缓存），读不到或全被拒就用代码里的默认值。"""
+    try:
+        st = os.stat(SERVERS_FILE)
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+        # 第一次跑（或换了机器）就把默认列表落成文件：这样运维有一个现成的位置可以
+        # SFTP 覆盖，不用猜格式。只在文件不存在时写，绝不覆盖别人改过的。
+        try:
+            with open(SERVERS_FILE, "w", encoding="utf-8") as f:
+                json.dump({"servers": DEFAULT_SERVERS}, f, ensure_ascii=False, indent=2)
+            st = os.stat(SERVERS_FILE)
+            stamp = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            pass
+    with _servers_lock:
+        if stamp is not None and _servers_cache["stamp"] == stamp:
+            return list(_servers_cache["list"])
+    out = []
+    if stamp is not None:
+        try:
+            with open(SERVERS_FILE, encoding="utf-8") as f:
+                raw = json.load(f)
+            items = raw.get("servers") if isinstance(raw, dict) else raw
+            if isinstance(items, list):
+                for it in items:
+                    if len(out) >= MAX_SERVERS:
+                        break
+                    one = _clean_server_url(it)
+                    if one and one not in out:
+                        out.append(one)
+        except (OSError, ValueError, AttributeError):
+            out = []
+    if not out:
+        out = list(DEFAULT_SERVERS)
+    with _servers_lock:
+        _servers_cache["stamp"] = stamp
+        _servers_cache["list"] = out
+    return list(out)
+
 
 ADMIN_HTML = r"""<!doctype html>
 <html lang="zh-CN">
@@ -1378,7 +1459,14 @@ class Handler(BaseHTTPRequestHandler):
             rooms, relay_rooms, pairs, _free = _gauge()
             return self._send({"ok": True, "version": VERSION, "rooms": rooms,
                                "relay_rooms": relay_rooms, "pairs": pairs,
-                               "ttl": TTL, "max_rooms": MAX_ROOMS})
+                               "ttl": TTL, "max_rooms": MAX_ROOMS,
+                               "servers": len(_servers_list())})
+        if path == "/api/servers":
+            # 客户端靠这一句知道现在有哪些大厅。内容是服务器自己说了算的，
+            # 客户端只做「是不是 http/https、域名是不是我们家的」这类校验。
+            return self._send({"ok": True, "version": VERSION,
+                               "servers": _servers_list(),
+                               "ttl": SERVER_LIST_TTL})
         if path == "/metrics":
             return self._send(_metrics_snapshot())
         if path == "/api/telemetry/summary":

@@ -1,0 +1,8 @@
+{
+  "_comment": "客户端内置的只有一个引导地址，真正的大厅列表由 GET /api/servers 下发。加一台机器＝在下面加一行，SFTP 覆盖这个文件即可，不用重新编译客户端、不用发版。改完可以立刻 curl /api/servers 验证。留空或写坏了会回退到代码里的 DEFAULT_SERVERS。",
+  "_updated": "2026-11-28",
+  "servers": [
+    "http://host.noblehost.cc:30811",
+    "http://de3.nodaroo.fun:28068"
+  ]
+}

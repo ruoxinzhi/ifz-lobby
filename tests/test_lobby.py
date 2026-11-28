@@ -104,6 +104,25 @@ def main():
               and "nofile" in m,
               "limits=%s nofile=%s" % (m.get("limits"), m.get("nofile")))
 
+        # ---- 节点列表下发：客户端只内置一个引导地址，其余由这里说了算 ----
+        srv = get(base + "/api/servers")
+        seed_file = os.path.join(os.path.dirname(data), "servers.json")
+        check("the node list is served and seeded next to the data",
+              srv.get("ok") and srv.get("servers") and os.path.isfile(seed_file),
+              json.dumps(srv, ensure_ascii=False))
+
+        with open(seed_file, "w", encoding="utf-8") as f:
+            json.dump({"servers": ["http://ok.nodaroo.fun:1", "ftp://bad", 42]}, f)
+        srv2 = get(base + "/api/servers")
+        check("editing servers.json takes effect without a restart",
+              srv2.get("servers") == ["http://ok.nodaroo.fun:1"], str(srv2.get("servers")))
+
+        with open(seed_file, "w", encoding="utf-8") as f:
+            f.write("{broken")
+        srv3 = get(base + "/api/servers")
+        check("a corrupt node list still answers with the built-in seed",
+              len(srv3.get("servers") or []) >= 1, str(srv3.get("servers")))
+
         codes = []
         for i in range(2):
             st, body = post(base + "/api/room", {"name": "room-%d" % i, "port": 7777})
@@ -111,7 +130,6 @@ def main():
                   str(st))
             if body.get("ok"):
                 codes.append(body)
-
         st, body = post(base + "/api/room", {"name": "room-3", "port": 7777})
         check("the per-IP cap refuses a third room", st == 429 and not body.get("ok"),
               "status=%s error=%s" % (st, body.get("error")))
