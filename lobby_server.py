@@ -18,6 +18,7 @@
   - token 是 32 位随机 hex，只有持有者能保活/注销，防止别人踢掉房间。
   - TTL 过期自动清理；房间数、单 IP 房间数、房间名长度都有限制。
 """
+import io
 import json
 import os
 import secrets
@@ -27,13 +28,14 @@ import socket
 import sys
 import threading
 import time
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
 PORT = int(os.environ.get("IFZ_LOBBY_PORT", "8080"))
 _NOFILE = -1
 # 网页面板没有命令行时，靠这一行确认「拉到的确实是新版」：浏览器打开 /health 就能看到。
-VERSION = "2026-11-28.3"
+VERSION = "2026-11-28.4"
 DATA = os.environ.get("IFZ_LOBBY_DATA", "/root/ifz-lobby/rooms.json")
 
 # ---- 运行时遥测 ----
@@ -45,6 +47,497 @@ TELEMETRY_MAX_BODY = int(os.environ.get("IFZ_TELEMETRY_MAX_BODY", str(160 * 1024
 TELEMETRY_PER_MIN = int(os.environ.get("IFZ_TELEMETRY_PER_MIN", "20"))
 TELEMETRY_KEEP_DAYS = int(os.environ.get("IFZ_TELEMETRY_KEEP_DAYS", "14"))
 TELEMETRY_MAX_SESSIONS_DAY = int(os.environ.get("IFZ_TELEMETRY_MAX_SESSIONS", "2000"))
+
+# ---- 运维面板 ----
+# 设了 IFZ_ADMIN_TOKEN 才开放 /admin。公网机器不设就是 403，这是刻意的：
+# 一个能看日志、能下载数据的面板不该靠「别人猜不到路径」来保护。
+ADMIN_TOKEN_ENV = os.environ.get("IFZ_ADMIN_TOKEN", "").strip()
+ADMIN_TOKEN_FILE = "admin.token"
+
+
+def _admin_token():
+    """管理令牌。环境变量优先，其次读 DATA 同目录的 admin.token。
+
+    读文件是为了「不用改面板环境变量、不用重启」——把文件 SFTP 上去就生效。
+    每次请求都读：面板的请求量是几十次/分钟，文件只有几字节。
+    """
+    if ADMIN_TOKEN_ENV:
+        return ADMIN_TOKEN_ENV
+    path = os.path.join(os.path.dirname(DATA) or ".", ADMIN_TOKEN_FILE)
+    try:
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as f:
+                return f.read().strip()
+    except OSError:
+        pass
+    return ""
+ADMIN_LOG_LINES_MAX = 2000
+
+ADMIN_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IFZ 运维面板</title>
+<style>
+:root{
+  --bg:#0a0e13; --card:#121820; --card2:#182130; --line:#233040;
+  --txt:#d7e3ef; --dim:#7f93a8; --accent:#4ea1d3; --ok:#4ec98a;
+  --warn:#e0b64a; --bad:#e26565; --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(1200px 600px at 20% -10%,#16243a 0%,var(--bg) 55%);
+  color:var(--txt);font:14px/1.55 system-ui,-apple-system,"Segoe UI","Noto Sans SC",sans-serif;
+  min-height:100vh}
+.wrap{max-width:1180px;margin:0 auto;padding:22px 20px 60px}
+header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:18px}
+h1{font-size:19px;margin:0;letter-spacing:.5px;font-weight:600}
+h1 b{color:var(--accent)}
+.meta{color:var(--dim);font-size:12.5px;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--ok);display:inline-block;
+  box-shadow:0 0 8px var(--ok)}
+.dot.bad{background:var(--bad);box-shadow:0 0 8px var(--bad)}
+.spacer{flex:1}
+button,select{background:var(--card2);color:var(--txt);border:1px solid var(--line);
+  border-radius:8px;padding:6px 12px;font-size:13px;cursor:pointer;transition:.15s}
+button:hover{border-color:var(--accent);color:#fff}
+button.on{background:var(--accent);border-color:var(--accent);color:#04121c;font-weight:600}
+button.ghost{background:transparent}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:18px}
+.stat{background:linear-gradient(180deg,var(--card2),var(--card));border:1px solid var(--line);
+  border-radius:12px;padding:14px 16px;position:relative;overflow:hidden}
+.stat:after{content:"";position:absolute;inset:0 auto 0 0;width:3px;background:var(--accent);opacity:.7}
+.stat.ok:after{background:var(--ok)} .stat.warn:after{background:var(--warn)}
+.stat.bad:after{background:var(--bad)}
+.stat .k{color:var(--dim);font-size:12px;letter-spacing:.4px}
+.stat .v{font-size:25px;font-weight:650;margin-top:4px;font-variant-numeric:tabular-nums}
+.stat .s{color:var(--dim);font-size:11.5px;margin-top:2px}
+.tabs{display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px;
+  margin-bottom:14px}
+.card h3{margin:0 0 12px;font-size:13px;color:var(--dim);font-weight:600;letter-spacing:.6px;
+  text-transform:uppercase}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;color:var(--dim);font-weight:500;font-size:11.5px;letter-spacing:.5px;
+  padding:6px 8px;border-bottom:1px solid var(--line);text-transform:uppercase}
+td{padding:7px 8px;border-bottom:1px solid #1a2431;vertical-align:middle}
+tr:hover td{background:#151d28}
+.mono{font-family:var(--mono);font-size:12.5px}
+.pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11.5px;
+  border:1px solid var(--line);color:var(--dim)}
+.pill.ok{color:var(--ok);border-color:#1f4a37;background:#102a1f}
+.pill.bad{color:var(--bad);border-color:#4a2020;background:#2a1414}
+.pill.warn{color:var(--warn);border-color:#4a3d1f;background:#2a2414}
+.bars{display:flex;flex-direction:column;gap:7px}
+.bar{display:grid;grid-template-columns:minmax(120px,240px) 1fr 54px;gap:10px;align-items:center;
+  font-size:12.5px}
+.bar .n{color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar .t{background:#0d141c;border-radius:5px;height:16px;overflow:hidden}
+.bar .f{height:100%;background:linear-gradient(90deg,#2b6f95,#4ea1d3);border-radius:5px}
+.bar .f.bad{background:linear-gradient(90deg,#7a2b2b,#e26565)}
+.bar .v{text-align:right;font-variant-numeric:tabular-nums;color:var(--txt)}
+pre{background:#080c11;border:1px solid var(--line);border-radius:10px;padding:14px;
+  overflow:auto;max-height:58vh;font-family:var(--mono);font-size:12px;line-height:1.6;
+  margin:0;white-space:pre-wrap;word-break:break-word}
+.empty{color:var(--dim);font-size:13px;padding:18px 4px}
+.hidden{display:none!important}
+.drawer{position:fixed;inset:0;background:#0008;backdrop-filter:blur(2px);z-index:50;
+  display:flex;justify-content:flex-end}
+.drawer .body{width:min(880px,94vw);height:100%;background:var(--bg);border-left:1px solid var(--line);
+  padding:18px 20px;overflow:auto;display:flex;flex-direction:column;gap:12px}
+.drawer header{margin:0}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+input[type=text],input[type=password]{background:#0d141c;border:1px solid var(--line);color:var(--txt);
+  border-radius:8px;padding:8px 12px;font-size:13px;min-width:220px}
+input:focus{outline:none;border-color:var(--accent)}
+.toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);background:var(--card2);
+  border:1px solid var(--accent);color:var(--txt);padding:9px 16px;border-radius:9px;font-size:13px;
+  opacity:0;transition:.25s;pointer-events:none;z-index:80}
+.toast.show{opacity:1}
+.gate{max-width:420px;margin:14vh auto;text-align:center}
+.gate h2{font-size:17px;margin:0 0 8px}
+.gate p{color:var(--dim);font-size:13px;margin:0 0 16px;line-height:1.7}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div id="gate" class="gate hidden">
+    <h2>需要管理令牌</h2>
+    <p>服务器设了 <code>IFZ_ADMIN_TOKEN</code>。<br>输入令牌后可访问；它会存在本机浏览器里。</p>
+    <div class="row" style="justify-content:center">
+      <input id="tok" type="password" placeholder="管理令牌" autocomplete="off">
+      <button onclick="saveToken()">进入</button>
+    </div>
+  </div>
+
+  <div id="main" class="hidden">
+    <header>
+      <span class="dot" id="dot"></span>
+      <h1><b>IFZ</b> 运维面板</h1>
+      <div class="meta" id="meta"></div>
+      <span class="spacer"></span>
+      <button id="auto" class="on" onclick="toggleAuto()">自动 5s</button>
+      <button onclick="loadAll(true)">刷新</button>
+    </header>
+
+    <div class="stats" id="stats"></div>
+
+    <div class="tabs">
+      <button class="on" data-tab="overview" onclick="switchTab('overview')">概览</button>
+      <button data-tab="rooms" onclick="switchTab('rooms')">房间</button>
+      <button data-tab="telemetry" onclick="switchTab('telemetry')">遥测</button>
+      <button data-tab="logs" onclick="switchTab('logs')">日志</button>
+    </div>
+
+    <div id="tab-overview">
+      <div class="card"><h3>联机链路</h3><div class="bars" id="linkbars"></div></div>
+      <div class="card"><h3>没生效的层（钩子数 = 0）</h3><div class="bars" id="zerobars"></div></div>
+      <div class="card"><h3>断线原因</h3><div class="bars" id="dropbars"></div></div>
+    </div>
+
+    <div id="tab-rooms" class="hidden">
+      <div class="card">
+        <div class="row" style="margin-bottom:10px">
+          <input id="q" type="text" placeholder="按房间名 / 房间号过滤" oninput="renderRooms()">
+          <span class="spacer"></span>
+          <span class="pill" id="roomcount"></span>
+        </div>
+        <table><thead><tr>
+          <th>房间号</th><th>名称</th><th>城市</th><th>地址</th><th>端口</th>
+          <th>人数</th><th>中转</th><th>更新</th>
+        </tr></thead><tbody id="roomrows"></tbody></table>
+      </div>
+    </div>
+
+    <div id="tab-telemetry" class="hidden">
+      <div class="card">
+        <div class="row">
+          <select id="day"></select>
+          <button onclick="loadSessions()">读取</button>
+          <span class="spacer"></span>
+          <button class="ghost" onclick="downloadZip()">下载这一天的全部日志</button>
+        </div>
+      </div>
+      <div class="card"><h3>版本分布</h3><div class="bars" id="modbars"></div></div>
+      <div class="card"><h3>系统分布</h3><div class="bars" id="osbars"></div></div>
+      <div class="card"><h3>错误 Top</h3><div class="bars" id="errbars"></div></div>
+      <div class="card">
+        <h3>会话</h3>
+        <table><thead><tr>
+          <th>时间</th><th>会话</th><th>版本</th><th>系统</th>
+          <th>事件</th><th>错误</th><th>时长</th><th></th>
+        </tr></thead><tbody id="sessrows"></tbody></table>
+      </div>
+    </div>
+
+    <div id="tab-logs" class="hidden">
+      <div class="card">
+        <div class="row" style="margin-bottom:12px">
+          <select id="logname">
+            <option value="supervisor.log">supervisor.log</option>
+            <option value="lobby.log">lobby.log</option>
+            <option value="supervisor.log.1">supervisor.log.1</option>
+          </select>
+          <select id="loglines">
+            <option>100</option><option selected>200</option>
+            <option>500</option><option>1000</option><option>2000</option>
+          </select>
+          <button onclick="loadLog()">读取</button>
+          <span class="spacer"></span>
+          <button class="ghost" onclick="downloadLog()">下载</button>
+        </div>
+        <pre id="logbox">—</pre>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="drawer" class="drawer hidden">
+  <div class="body">
+    <header>
+      <h1 style="font-size:16px" id="dtitle">会话详情</h1>
+      <span class="spacer"></span>
+      <button onclick="closeDrawer()">关闭</button>
+    </header>
+    <div class="meta" id="dmeta"></div>
+    <div class="row">
+      <select id="dlvl" onchange="renderEvents()">
+        <option value="">全部</option><option value="error">只看错误</option>
+        <option value="warn">只看警告</option><option value="info">只看信息</option>
+      </select>
+      <span class="pill" id="devcount"></span>
+      <span class="spacer"></span>
+      <button class="ghost" onclick="downloadSession()">下载这个会话</button>
+    </div>
+    <pre id="devents"></pre>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+var TOKEN = localStorage.getItem("ifz_admin") || "";
+var tab = "overview", auto = true, timer = null;
+var data = { overview:null, rooms:[], sessions:[], detail:null, day:"" };
+var lastRooms = [];
+
+function $(id){ return document.getElementById(id); }
+function esc(s){
+  return String(s == null ? "" : s).replace(/[&<>"']/g, function(c){
+    return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];
+  });
+}
+function toast(msg){
+  var t = $("toast"); t.textContent = msg; t.classList.add("show");
+  setTimeout(function(){ t.classList.remove("show"); }, 1800);
+}
+function saveToken(){
+  TOKEN = $("tok").value.trim();
+  localStorage.setItem("ifz_admin", TOKEN);
+  boot();
+}
+function api(path){
+  return fetch(path, { headers: { "X-Admin-Token": TOKEN } }).then(function(r){
+    if (r.status === 401 || r.status === 403) { throw { auth: true }; }
+    if (!r.ok) { throw new Error("HTTP " + r.status); }
+    return r.json();
+  });
+}
+function withTok(url){
+  return url + (url.indexOf("?") >= 0 ? "&" : "?") + "token=" + encodeURIComponent(TOKEN);
+}
+
+function boot(){
+  $("gate").classList.add("hidden");
+  $("main").classList.add("hidden");
+  api("/admin/api/overview").then(function(d){
+    $("main").classList.remove("hidden");
+    data.overview = d;
+    renderOverview();
+    loadRooms();
+    loadDays();
+    if (!timer && auto) timer = setInterval(tick, 5000);
+  }).catch(function(e){
+    if (e && e.auth) { $("gate").classList.remove("hidden"); }
+    else { $("gate").classList.remove("hidden"); $("tok").placeholder = "无法连接服务端"; }
+  });
+}
+function tick(){ if (auto) loadAll(false); }
+function toggleAuto(){
+  auto = !auto;
+  $("auto").classList.toggle("on", auto);
+  $("auto").textContent = auto ? "自动 5s" : "已暂停";
+  if (auto && !timer) timer = setInterval(tick, 5000);
+  if (!auto && timer) { clearInterval(timer); timer = null; }
+}
+function switchTab(name){
+  tab = name;
+  ["overview","rooms","telemetry","logs"].forEach(function(k){
+    $("tab-" + k).classList.toggle("hidden", k !== name);
+    document.querySelector('[data-tab="' + k + '"]').classList.toggle("on", k === name);
+  });
+  if (name === "telemetry" && !data.sessions.length) loadSessions();
+  if (name === "logs") loadLog();
+}
+
+function fmtDur(s){
+  if (!s) return "—";
+  if (s < 90) return Math.round(s) + " 秒";
+  if (s < 5400) return Math.round(s / 60) + " 分";
+  return (s / 3600).toFixed(1) + " 小时";
+}
+function bar(el, rows, cls){
+  var max = 1;
+  rows.forEach(function(r){ if (r[1] > max) max = r[1]; });
+  if (!rows.length) { el.innerHTML = '<div class="empty">暂无数据</div>'; return; }
+  el.innerHTML = rows.slice(0, 8).map(function(r){
+    var pct = Math.max(2, Math.round(r[1] * 100 / max));
+    return '<div class="bar"><span class="n" title="' + esc(r[0]) + '">' + esc(r[0]) + '</span>' +
+      '<span class="t"><span class="f ' + (cls || "") + '" style="width:' + pct + '%"></span></span>' +
+      '<span class="v">' + r[1] + '</span></div>';
+  }).join("");
+}
+function pairs(o){
+  var out = [];
+  for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) out.push([k, o[k]]);
+  out.sort(function(a, b){ return b[1] - a[1]; });
+  return out;
+}
+
+function renderOverview(){
+  var d = data.overview; if (!d) return;
+  var m = d.metrics || {}, s = d.telstats || {}, sum = d.summary || {};
+  var up = m.uptime_sec || 0;
+  $("dot").className = "dot" + (m.ok ? "" : " bad");
+  $("meta").innerHTML =
+    "<span>" + esc(d.host) + "</span><span>·</span><span>版本 " + esc(m.version || "?") + "</span>" +
+    "<span>·</span><span>运行 " + fmtDur(up) + "</span>";
+  var cards = [
+    ["房间", m.rooms, "/ " + (m.limits ? m.limits.max_rooms : "?") + " 上限", m.rooms > 0 ? "ok" : ""],
+    ["中转对", m.pairs, (m.free_seats || 0) + " 个空位", m.pairs > 0 ? "ok" : ""],
+    ["带宽", (m.mbps_since_last || 0).toFixed(2), "Mbps（近一分钟）", ""],
+    ["线程", m.threads, "nofile " + (m.nofile > 0 ? m.nofile : "?"), ""],
+    ["今日会话", sum.sessions || 0, "事件 " + (sum.events || 0), ""],
+    ["错误", sum.errors || 0, "警告 " + (sum.warns || 0), (sum.errors || 0) > 0 ? "bad" : "ok"],
+    ["拒绝注册", ((m.rejects && (m.rejects.full + m.rejects.ip + m.rejects.bad)) || 0), "满/限流/非法", ""],
+    ["遥测积压", (s.pending || 0), "已归档 " + ((s.bytes || 0) / 1024).toFixed(0) + " KB", ""]
+  ];
+  $("stats").innerHTML = cards.map(function(c){
+    return '<div class="stat ' + c[3] + '"><div class="k">' + c[0] + '</div>' +
+      '<div class="v">' + esc(c[1]) + '</div><div class="s">' + esc(c[2]) + '</div></div>';
+  }).join("");
+
+  var net = pairs(m.link_kinds || {});
+  bar($("linkbars"), net.length ? net : [["直连", 0], ["中转", 0], ["Steam", 0]], "");
+  bar($("zerobars"), pairs(sum.layer_zero || {}), "bad");
+  bar($("dropbars"), pairs(sum.drop || {}), "bad");
+  renderDist();
+}
+function renderDist(){
+  var d = data.overview; if (!d) return;
+  var sum = d.summary || {};
+  bar($("modbars"), pairs(sum.mod || {}), "");
+  bar($("osbars"), pairs(sum.os || {}), "");
+  bar($("errbars"), pairs(sum.error || {}), "bad");
+}
+
+function loadAll(manual){
+  api("/admin/api/overview").then(function(d){
+    data.overview = d; renderOverview();
+    if (manual) toast("已刷新");
+  }).catch(function(){ $("dot").className = "dot bad"; });
+  loadRooms();
+  if (tab === "telemetry" && data.day) loadSessions();
+  if (tab === "logs") loadLog();
+}
+function loadRooms(){
+  api("/admin/api/rooms").then(function(d){
+    lastRooms = d.rooms || [];
+    renderRooms();
+  }).catch(function(){});
+}
+function renderRooms(){
+  var q = ($("q").value || "").toLowerCase();
+  var rows = lastRooms.filter(function(r){
+    return !q || (r.name || "").toLowerCase().indexOf(q) >= 0
+      || (r.code || "").toLowerCase().indexOf(q) >= 0;
+  });
+  $("roomcount").textContent = rows.length + " 间";
+  if (!rows.length) {
+    $("roomrows").innerHTML = '<tr><td colspan="8" class="empty">没有房间</td></tr>';
+    return;
+  }
+  $("roomrows").innerHTML = rows.map(function(r){
+    return "<tr><td class='mono'>" + esc(r.code) + "</td><td>" + esc(r.name) + "</td>" +
+      "<td>" + esc(r.city || "—") + "</td><td class='mono'>" + esc(r.ip || "—") + "</td>" +
+      "<td class='mono'>" + esc(r.port) + "</td><td>" + esc(r.players) + "</td>" +
+      "<td>" + (r.relay ? "<span class='pill ok'>" + esc(r.relay) + "</span>" : "<span class='pill'>—</span>") + "</td>" +
+      "<td class='mono'>" + esc(r.age) + "s</td></tr>";
+  }).join("");
+}
+
+function loadDays(){
+  var d = data.overview; if (!d) return;
+  var days = d.days || [];
+  if (!days.length) return;
+  $("day").innerHTML = days.map(function(x){
+    return '<option value="' + esc(x) + '">' + esc(x) + '</option>';
+  }).join("");
+  data.day = days[0];
+  $("day").onchange = function(){ data.day = this.value; loadSessions(); };
+}
+function loadSessions(){
+  if (!data.day) return;
+  api("/admin/api/sessions?day=" + encodeURIComponent(data.day)).then(function(d){
+    data.sessions = d.sessions || [];
+    renderSessions();
+    renderDist();
+  }).catch(function(){});
+}
+function renderSessions(){
+  var rows = data.sessions;
+  if (!rows.length) {
+    $("sessrows").innerHTML = '<tr><td colspan="8" class="empty">这一天还没有数据</td></tr>';
+    return;
+  }
+  $("sessrows").innerHTML = rows.map(function(r){
+    var t = new Date(r.mtime * 1000);
+    var hh = ("0" + t.getHours()).slice(-2) + ":" + ("0" + t.getMinutes()).slice(-2);
+    return "<tr><td class='mono'>" + hh + "</td>" +
+      "<td class='mono'>" + esc(r.session.slice(0, 10)) + "</td>" +
+      "<td>" + esc(String(r.mod).replace("IFZ.ModPack ", "")) + "</td>" +
+      "<td class='mono'>" + esc(String(r.os).slice(0, 22)) + "</td>" +
+      "<td>" + r.events + "</td>" +
+      "<td>" + (r.errors ? "<span class='pill bad'>" + r.errors + "</span>" : "0") + "</td>" +
+      "<td>" + fmtDur(r.seconds) + "</td>" +
+      "<td><button onclick=\"openSession('" + esc(r.session) + "')\">详情</button></td></tr>";
+  }).join("");
+}
+function openSession(id){
+  api("/admin/api/session?day=" + encodeURIComponent(data.day) + "&id=" + encodeURIComponent(id))
+    .then(function(d){
+      data.detail = d;
+      $("dtitle").textContent = "会话 " + id.slice(0, 12);
+      var env = d.env || {};
+      $("dmeta").innerHTML = [
+        esc(env.mod || "?"), esc(env.os || "?"), esc(env.game || "?"),
+        (env.cores || "?") + " 核", (env.mem_mb || "?") + " MB",
+        esc(env.screen || "?"), "IP " + esc(d.ip || "?"),
+        d.batches + " 批 / " + d.total + " 条"
+      ].join(" · ");
+      $("drawer").classList.remove("hidden");
+      renderEvents();
+    }).catch(function(){ toast("读取失败"); });
+}
+function renderEvents(){
+  var d = data.detail; if (!d) return;
+  var lvl = $("dlvl").value;
+  var evs = (d.events || []).filter(function(e){ return !lvl || e.lvl === lvl; });
+  $("devcount").textContent = evs.length + " 条";
+  $("devents").textContent = evs.map(function(e){
+    var f = e.f ? " " + JSON.stringify(e.f) : "";
+    var err = e.err ? "\n    " + e.err : "";
+    var tag = e.lvl === "error" ? "ERR " : e.lvl === "warn" ? "WRN " : "    ";
+    return tag + ("     " + e.t).slice(-8) + "  " + e.cat + "." + e.ev + f + err;
+  }).join("\n") || "（没有匹配的事件）";
+}
+function closeDrawer(){ $("drawer").classList.add("hidden"); }
+function downloadSession(){
+  var d = data.detail; if (!d) return;
+  location.href = withTok("/api/telemetry/download?day=" + encodeURIComponent(data.day) +
+    "&session=" + encodeURIComponent(d.session));
+}
+function downloadZip(){
+  if (!data.day) return;
+  location.href = withTok("/api/telemetry/download?day=" + encodeURIComponent(data.day));
+}
+function loadLog(){
+  var name = $("logname").value, lines = $("loglines").value;
+  api("/admin/api/logs?name=" + encodeURIComponent(name) + "&lines=" + lines)
+    .then(function(d){
+      $("logbox").textContent = d.text || "（空）";
+      $("logbox").scrollTop = $("logbox").scrollHeight;
+    }).catch(function(e){
+      $("logbox").textContent = "读取失败：" + (e.message || e);
+    });
+}
+function downloadLog(){
+  var name = $("logname").value;
+  location.href = withTok("/admin/api/logs?name=" + encodeURIComponent(name) +
+    "&lines=" + $("loglines").value + "&download=1");
+}
+document.addEventListener("keydown", function(e){
+  if (e.key === "Escape") closeDrawer();
+});
+document.addEventListener("DOMContentLoaded", function(){
+  $("tok").addEventListener("keydown", function(e){ if (e.key === "Enter") saveToken(); });
+  if (TOKEN) boot(); else $("gate").classList.remove("hidden");
+});
+</script>
+</body>
+</html>
+"""
+
 TTL = int(os.environ.get("IFZ_LOBBY_TTL", "90"))        # 秒无心跳即过期
 # 房间数上限按带宽反推：8 人满房约 5 Mbps，120 房远高于单机出口能力，
 # 真到瓶颈时先看 /metrics 的 mbps，而不是等房间号用完。
@@ -181,6 +674,7 @@ def _tel_store(session, body):
         _tel_stats["sessions"].add(day + "/" + session)
         _tel_stats["events"] += len(body.get("events") or [])
         _tel_stats["bytes"] += len(line)
+        _tel_cache["at"] = 0.0      # 有新数据进来，汇总立刻失效
     return len(line)
 
 
@@ -204,6 +698,104 @@ def _tel_prune():
                     pass
     except Exception:
         pass
+
+
+def _admin_ok(headers, query):
+    """面板鉴权。没配 token 一律拒绝，绝不放行「空 token 等于无鉴权」。"""
+    token = _admin_token()
+    if not token:
+        return False
+    given = (query.get("token", [""])[0] or headers.get("X-Admin-Token", "") or "").strip()
+    if not given:
+        return False
+    return secrets.compare_digest(given, token)
+
+
+def _admin_sessions(day):
+    """某个日期下的会话清单。带 60 秒缓存，别让面板刷新把磁盘读爆。"""
+    folder = os.path.join(TELEMETRY_DIR, day)
+    if not os.path.isdir(folder):
+        return []
+    out = []
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return []
+    for name in names[:TELEMETRY_MAX_SESSIONS_DAY]:
+        if not name.endswith(".jsonl"):
+            continue
+        path = os.path.join(folder, name)
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        env, events, errors, first, last, ip = None, 0, 0, None, None, ""
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except ValueError:
+                        continue
+                    if env is None:
+                        env = payload.get("env")
+                        ip = payload.get("ip", "")
+                    evs = payload.get("events") or []
+                    events += len(evs)
+                    for ev in evs:
+                        if ev.get("lvl") == "error":
+                            errors += 1
+                        t = ev.get("t")
+                        if isinstance(t, (int, float)):
+                            if first is None or t < first:
+                                first = t
+                            if last is None or t > last:
+                                last = t
+        except OSError:
+            continue
+        env = env or {}
+        out.append({
+            "session": name[:-6],
+            "bytes": st.st_size,
+            "mtime": int(st.st_mtime),
+            "events": events,
+            "errors": errors,
+            "ip": ip,
+            "mod": env.get("mod", "?"),
+            "os": env.get("os", "?"),
+            "game": env.get("game", "?"),
+            "seconds": round((last - first), 1) if (first is not None and last is not None) else 0,
+        })
+    out.sort(key=lambda x: x["mtime"], reverse=True)
+    return out
+
+
+def _tel_zip(day, session=""):
+    """把归档打成 zip 返回字节。单个会话给 jsonl，整天给全部会话。"""
+    folder = os.path.join(TELEMETRY_DIR, day) if day else TELEMETRY_DIR
+    if not os.path.isdir(folder):
+        return None, "not found"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        if session:
+            safe = _tel_safe_session(session)
+            if safe is None:
+                return None, "bad session"
+            path = os.path.join(folder, safe + ".jsonl")
+            if not os.path.isfile(path):
+                return None, "not found"
+            z.write(path, arcname=safe + ".jsonl")
+        else:
+            for name in sorted(os.listdir(folder)):
+                if not name.endswith(".jsonl"):
+                    continue
+                path = os.path.join(folder, name)
+                if os.path.isfile(path):
+                    z.write(path, arcname="%s/%s" % (day or "telemetry", name))
+    return buf.getvalue(), ""
 
 
 def _tel_mask_ip(ip):
@@ -299,9 +891,14 @@ def _tel_absorb(out, payload):
     _tel_bump(out["lang"], str(env.get("lang", "?")))
     _tel_bump(out["cores"], str(env.get("cores", "?")))
     net = env.get("net") or {}
-    if net.get("fail"):
-        out.setdefault("link_fail_total", 0)
-        out["link_fail_total"] += int(net["fail"])
+    for kind in ("direct", "relay", "steam", "fail", "drops"):
+        try:
+            n = int(net.get(kind) or 0)
+        except (TypeError, ValueError):
+            continue
+        if n:
+            key = "link_" + kind
+            out[key] = out.get(key, 0) + n
 
     for ev in payload.get("events") or []:
         cat = str(ev.get("cat", "?"))
@@ -332,6 +929,52 @@ def _tel_absorb(out, payload):
             for k, v in fields.items():
                 if isinstance(v, int) and v == 0 and k not in ("menu",):
                     _tel_bump(out["layer_zero"], k)
+
+
+def _metrics_snapshot():
+    """一次算齐所有指标。面板与 /metrics 共用，避免两处算法漂移。"""
+    with _lock:
+        _prune_locked()
+    rooms, relay_rooms, pairs, free = _gauge()
+    mbps = _mbps_since_last()
+    with _stats_lock:
+        snap = dict(_stats)
+        uptime = int(time.time() - snap["since"])
+    return {
+        "ok": True, "version": VERSION, "uptime_sec": uptime,
+        "rooms": rooms, "relay_rooms": relay_rooms,
+        "pairs": pairs, "free_seats": free,
+        "mbps_since_last": mbps,
+        "bytes_relayed": snap["bytes"],
+        "tunnels_opened": snap["tunnels"],
+        "pairs_made": snap["pairs"],
+        "registrations": snap["registrations"],
+        "rejects": {"full": snap["reject_full"], "ip": snap["reject_ip"],
+                    "bad": snap["reject_bad"]},
+        "limits": {"max_rooms": MAX_ROOMS, "max_per_ip": MAX_PER_IP,
+                   "seats": MAX_RELAY_GUESTS},
+        "nofile": _NOFILE,
+        "threads": threading.active_count(),
+    }
+
+
+def _tail_log(name, lines):
+    """读日志尾部。白名单文件名 + 最多 2000 行 / 200KB，防止被当成任意文件读取。"""
+    if name not in ("supervisor.log", "lobby.log", "supervisor.log.1", "lobby.log.1"):
+        return None, "bad name"
+    path = os.path.join(os.path.dirname(DATA) or ".", name)
+    if not os.path.isfile(path):
+        return None, "not found"
+    lines = max(1, min(ADMIN_LOG_LINES_MAX, int(lines)))
+    try:
+        size = os.path.getsize(path)
+        block = min(size, 200 * 1024)
+        with open(path, "rb") as f:
+            f.seek(size - block)
+            text = f.read().decode("utf-8", "replace")
+    except OSError as e:
+        return None, str(e)[:120]
+    return "\n".join(text.splitlines()[-lines:]), ""
 
 
 def _now():
@@ -541,6 +1184,82 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _send_raw(self, body, content_type, status=200, filename=None):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if filename:
+            self.send_header("Content-Disposition",
+                             'attachment; filename="%s"' % filename)
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _admin_api(self, path, q):
+        """面板的数据端点。全部返回 JSON，前端只做渲染。"""
+        name = path[len("/admin/api/"):]
+        if name == "overview":
+            days = []
+            if os.path.isdir(TELEMETRY_DIR):
+                days = sorted([d for d in os.listdir(TELEMETRY_DIR)
+                               if os.path.isdir(os.path.join(TELEMETRY_DIR, d))],
+                              reverse=True)[:30]
+            with _tel_lock:
+                snap = dict(_tel_stats)
+                for k in ("sessions",):
+                    snap[k] = len(snap.get(k) or [])
+                snap["pending"] = 0
+            summary = _tel_summary(1)
+            return self._send({
+                "ok": True,
+                "host": socket.gethostname(),
+                "version": VERSION,
+                "metrics": _metrics_snapshot(),
+                "telstats": snap,
+                "summary": summary,
+                "days": days,
+            })
+        if name == "rooms":
+            now = _now()
+            with _lock:
+                _prune_locked()
+                rows = []
+                for code, r in _rooms.items():
+                    rows.append({
+                        "code": code, "name": r.get("name", ""),
+                        "city": r.get("city", ""), "ip": r.get("ip", ""),
+                        "port": r.get("port"), "players": r.get("players", 1),
+                        "relay": r.get("relay", ""),
+                        "age": int(now - r.get("updated", now)),
+                    })
+            rows.sort(key=lambda x: x["age"])
+            return self._send({"ok": True, "rooms": rows})
+        if name == "sessions":
+            day = (q.get("day", [""])[0] or "").strip()
+            if len(day) != 10 or not day.replace("-", "").isdigit():
+                return self._send({"ok": False, "error": "bad day"}, 400)
+            return self._send({"ok": True, "day": day, "sessions": _admin_sessions(day)})
+        if name == "session":
+            day = (q.get("day", [""])[0] or "").strip()
+            sid = (q.get("id", [""])[0] or "").strip()
+            if len(day) != 10 or _tel_safe_session(sid) is None:
+                return self._send({"ok": False, "error": "bad args"}, 400)
+            return self._send(_tel_session(day, sid))
+        if name == "logs":
+            text, err = _tail_log((q.get("name", [""])[0] or ""),
+                                  (q.get("lines", ["200"])[0] or "200"))
+            if text is None:
+                return self._send({"ok": False, "error": err}, 404)
+            if (q.get("download", [""])[0] or "") == "1":
+                data = text.encode("utf-8")
+                return self._send_raw(data, "text/plain; charset=utf-8",
+                                      filename=(q.get("name", ["log"])[0] or "log") + ".txt")
+            return self._send({"ok": True, "text": text})
+        return self._send({"ok": False, "error": "unknown"}, 404)
+
     def _telemetry(self):
         """POST /api/telemetry。
 
@@ -627,6 +1346,32 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urlparse(self.path)
         path = u.path
+        # ---- 运维面板 ----
+        q = parse_qs(u.query)
+        if path in ("/admin", "/admin/"):
+            # 页面本身是登录框，不含任何数据，可以公开；数据接口一律要令牌。
+            if not _admin_token():
+                return self._send({"ok": False, "error": "admin disabled",
+                                   "hint": "set IFZ_ADMIN_TOKEN or create admin.token"}, 403)
+            return self._send_raw(ADMIN_HTML.encode("utf-8"),
+                                  "text/html; charset=utf-8")
+        if path.startswith("/admin/api/"):
+            if not _admin_ok(self.headers, q):
+                return self._send({"ok": False, "error": "unauthorized"}, 401)
+            return self._admin_api(path, q)
+        if path == "/api/telemetry/download":
+            if not _admin_ok(self.headers, q):
+                return self._send({"ok": False, "error": "unauthorized"}, 401)
+            day = (q.get("day", [""])[0] or "").strip()
+            sid = (q.get("session", [""])[0] or "").strip()
+            if day and (len(day) != 10 or not day.replace("-", "").isdigit()):
+                return self._send({"ok": False, "error": "bad day"}, 400)
+            data, err = _tel_zip(day, sid)
+            if data is None:
+                return self._send({"ok": False, "error": err}, 404)
+            name = (sid + ".jsonl.zip") if sid else ("ifz-telemetry-%s.zip" % (day or "all"))
+            return self._send_raw(data, "application/zip", filename=name)
+
         if path == "/health":
             with _lock:
                 _prune_locked()
@@ -635,29 +1380,7 @@ class Handler(BaseHTTPRequestHandler):
                                "relay_rooms": relay_rooms, "pairs": pairs,
                                "ttl": TTL, "max_rooms": MAX_ROOMS})
         if path == "/metrics":
-            with _lock:
-                _prune_locked()
-            rooms, relay_rooms, pairs, free = _gauge()
-            mbps = _mbps_since_last()
-            with _stats_lock:
-                snap = dict(_stats)
-                uptime = int(time.time() - snap["since"])
-            return self._send({
-                "ok": True, "version": VERSION, "uptime_sec": uptime,
-                "rooms": rooms, "relay_rooms": relay_rooms,
-                "pairs": pairs, "free_seats": free,
-                "mbps_since_last": mbps,
-                "bytes_relayed": snap["bytes"],
-                "tunnels_opened": snap["tunnels"],
-                "pairs_made": snap["pairs"],
-                "registrations": snap["registrations"],
-                "rejects": {"full": snap["reject_full"], "ip": snap["reject_ip"],
-                            "bad": snap["reject_bad"]},
-                "limits": {"max_rooms": MAX_ROOMS, "max_per_ip": MAX_PER_IP,
-                           "seats": MAX_RELAY_GUESTS},
-                "nofile": _NOFILE,
-                "threads": threading.active_count(),
-            })
+            return self._send(_metrics_snapshot())
         if path == "/api/telemetry/summary":
             days = parse_qs(u.query).get("days", ["7"])[0]
             try:
